@@ -69,6 +69,7 @@ script_path = os.path.split(os.path.realpath(sys.argv[0]))[0]
 config_file = f'{script_path}/config/config.ini'
 url_config_file = f'{script_path}/config/URL_config.ini'
 backup_dir = f'{script_path}/backup_config'
+ffmpeg_log_file = f'{script_path}/logs/ffmpeg.log'
 text_encoding = 'utf-8-sig'
 rstr = r"[\/\\\:\*\？?\"\<\>\|&#.。,， ~！· ]"
 default_path = f'{script_path}/downloads'
@@ -417,12 +418,21 @@ def direct_download_stream(source_url: str, save_path: str, record_name: str, li
         return False
 
 
+def write_ffmpeg_log(record_name: str, message: str) -> None:
+    with open(ffmpeg_log_file, 'a', encoding='utf-8') as f:
+        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [{record_name}] {message}\n")
+
+
 def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, save_type: str,
                      script_command: str | None = None) -> bool:
     save_file_path = ffmpeg_command[-1]
-    process = subprocess.Popen(
-        ffmpeg_command, stdin=subprocess.PIPE, stderr=subprocess.STDOUT, startupinfo=get_startup_info(os_type)
-    )
+    write_ffmpeg_log(record_name, f"开始录制: {save_file_path}")
+    # 屏幕每5秒清屏一次, ffmpeg的报错直接追加到日志文件, 断流原因才能留下来
+    with open(ffmpeg_log_file, 'ab') as ffmpeg_log:
+        process = subprocess.Popen(
+            ffmpeg_command, stdin=subprocess.PIPE, stdout=ffmpeg_log, stderr=subprocess.STDOUT,
+            startupinfo=get_startup_info(os_type)
+        )
 
     subs_file_path = save_file_path.rsplit('.', maxsplit=1)[0]
     subs_thread_name = f'subs_{Path(subs_file_path).name}'
@@ -445,10 +455,12 @@ def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, sa
             else:
                 process.send_signal(signal.SIGINT)
             process.wait()
+            write_ffmpeg_log(record_name, f"录制时被注释或程序退出, ffmpeg已停止, 返回码: {process.returncode}")
             return True
         time.sleep(1)
 
     return_code = process.returncode
+    write_ffmpeg_log(record_name, f"ffmpeg退出, 返回码: {return_code}")
     stop_time = time.strftime('%Y-%m-%d %H:%M:%S')
     if return_code == 0:
         if converts_to_mp4 and save_type == 'TS':
@@ -1602,6 +1614,7 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
                                                 error_window.append(1)
 
                                 count_time = time.time()
+                                record_finished = True
 
                 except Exception as e:
                     logger.error(f"错误信息: {e} 发生错误的行数: {e.__traceback__.tb_lineno}")
