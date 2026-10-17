@@ -70,6 +70,7 @@ config_file = f'{script_path}/config/config.ini'
 url_config_file = f'{script_path}/config/URL_config.ini'
 backup_dir = f'{script_path}/backup_config'
 ffmpeg_log_file = f'{script_path}/logs/ffmpeg.log'
+ffmpeg_stall_seconds = 60
 text_encoding = 'utf-8-sig'
 rstr = r"[\/\\\:\*\？?\"\<\>\|&#.。,， ~！· ]"
 default_path = f'{script_path}/downloads'
@@ -423,6 +424,21 @@ def write_ffmpeg_log(record_name: str, message: str) -> None:
         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [{record_name}] {message}\n")
 
 
+def get_recorded_size(save_file_path: str) -> int:
+    prefix = os.path.basename(save_file_path).split('%')[0]
+    return sum(os.path.getsize(path) for path in utils.get_file_paths(os.path.dirname(save_file_path))
+               if os.path.basename(path).startswith(prefix))
+
+
+def stop_ffmpeg(process: subprocess.Popen) -> None:
+    if os.name == 'nt':
+        if process.stdin:
+            process.stdin.write(b'q')
+            process.stdin.close()
+    else:
+        process.send_signal(signal.SIGINT)
+
+
 def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, save_type: str,
                      script_command: str | None = None) -> bool:
     save_file_path = ffmpeg_command[-1]
@@ -443,26 +459,37 @@ def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, sa
         create_var[subs_thread_name].daemon = True
         create_var[subs_thread_name].start()
 
+    stalled = False
+    last_size, last_growth_time = -1, time.time()
     while process.poll() is None:
         if record_url in url_comments or exit_recording:
             color_obj.print_colored(f"[{record_name}]录制时已被注释,本条线程将会退出", color_obj.YELLOW)
             clear_record_info(record_name, record_url)
             # process.terminate()
-            if os.name == 'nt':
-                if process.stdin:
-                    process.stdin.write(b'q')
-                    process.stdin.close()
-            else:
-                process.send_signal(signal.SIGINT)
+            stop_ffmpeg(process)
             process.wait()
             write_ffmpeg_log(record_name, f"录制时被注释或程序退出, ffmpeg已停止, 返回码: {process.returncode}")
             return True
+        recorded_size = get_recorded_size(save_file_path)
+        if recorded_size != last_size:
+            last_size, last_growth_time = recorded_size, time.time()
+        elif time.time() - last_growth_time > ffmpeg_stall_seconds:
+            # 连接没断但一直没有音视频数据时ffmpeg不会超时退出, 只能看录制文件还长不长
+            write_ffmpeg_log(record_name, f"录制文件{ffmpeg_stall_seconds}秒没有增长, 判定ffmpeg卡死, 停止录制")
+            stalled = True
+            stop_ffmpeg(process)
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            break
         time.sleep(1)
 
     return_code = process.returncode
     write_ffmpeg_log(record_name, f"ffmpeg退出, 返回码: {return_code}")
     stop_time = time.strftime('%Y-%m-%d %H:%M:%S')
-    if return_code == 0:
+    if return_code == 0 or stalled:
         if converts_to_mp4 and save_type == 'TS':
             if split_video_by_time:
                 file_paths = utils.get_file_paths(os.path.dirname(save_file_path))

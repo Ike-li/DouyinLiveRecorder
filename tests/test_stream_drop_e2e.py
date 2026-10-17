@@ -1,8 +1,10 @@
-"""端到端测试: 拉流中途断开后要尽快重新录制, ffmpeg 的输出要写进 logs/ffmpeg.log.
+"""端到端测试: 拉流出问题时要尽快重新录制, ffmpeg 的输出要写进 logs/ffmpeg.log.
 
-在临时目录里复制一份程序, 用本地假 CDN 当"自定义录制直播"的 FLV 源:
-第一次连接播放 8 秒后被重置(模拟断流), 之后的连接正常播放.
-需要 ffmpeg 和 ffprobe, 整个用例大约 1~2 分钟.
+在临时目录里复制一份程序, 用本地假 CDN 当"自定义录制直播"的 FLV 源. 第一次连接播放 8 秒后:
+- StreamDropTest: 连接被重置(模拟断流);
+- FfmpegStallTest: 连接不断, 只发元数据不发音视频. ffmpeg 一直收得到字节所以不会超时退出,
+  但也没有东西可写(模拟 ffmpeg 卡死, 见上游 issue #1067).
+之后的连接都正常播放. 需要 ffmpeg 和 ffprobe, 全部用例大约 3 分钟.
 
 运行: uv run python -m unittest discover -s tests -v
 """
@@ -25,6 +27,9 @@ PROGRAM_FILES = ["main.py", "msg_push.py", "ffmpeg_install.py", "i18n.py", "i18n
 CUT_AFTER_SECONDS = 8
 # 修复前断流后要等满一个循环时间(这里配置为300秒)才会重新拉流
 RESTART_DEADLINE_SECONDS = 75
+# 卡死要等看门狗判定(60秒)再加30秒后重新检测
+STALL_RESTART_DEADLINE_SECONDS = 150
+STALL_KEEPALIVE_SECONDS = 200
 
 CONFIG = """[录制设置]
 language(zh_cn/en) = zh_cn
@@ -79,10 +84,13 @@ def probe_duration(path: Path) -> float:
 
 
 class FakeLiveCDN:
-    """按真实时间推送 FLV(chunked), 第一次连接播放 CUT_AFTER_SECONDS 秒后用 RST 断开."""
+    """按真实时间推送 FLV(chunked). 第一次连接播放 CUT_AFTER_SECONDS 秒后,
+    first_connection="reset" 用 RST 断开, "stall" 则保持连接、每秒只发一个元数据标签."""
 
-    def __init__(self, source: Path):
+    def __init__(self, source: Path, first_connection: str):
         self.header, self.tags = read_flv_tags(source)
+        self.metadata_tag = next(tag for _, tag in self.tags if tag[0] & 0x1F == 18)
+        self.first_connection = first_connection
         self.events: list[tuple[float, str]] = []
         self.request_count = 0
         self.lock = threading.Lock()
@@ -108,9 +116,16 @@ class FakeLiveCDN:
                     self.write_chunk(cdn.header)
                     for timestamp, tag in cdn.tags:
                         if number == 1 and timestamp >= CUT_AFTER_SECONDS:
-                            self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
                             self.close_connection = True
-                            cdn.record("cut")
+                            if cdn.first_connection == "reset":
+                                self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+                                cdn.record("cut")
+                            else:
+                                cdn.record("stall")
+                                keepalive_until = time.monotonic() + STALL_KEEPALIVE_SECONDS
+                                while time.monotonic() < keepalive_until:
+                                    self.write_chunk(cdn.metadata_tag)
+                                    time.sleep(1)
                             return
                         delay = timestamp - (time.monotonic() - start)
                         if delay > 0:
@@ -144,9 +159,11 @@ class FakeLiveCDN:
         return False
 
 
-@unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "需要 ffmpeg 和 ffprobe")
-@unittest.skipIf(os.name == "nt", "用到了 POSIX 进程组")
-class StreamDropTest(unittest.TestCase):
+class LiveRecorderScenario:
+    """复制程序、启动假 CDN 和 main.py, 跑子类的 run_scenario, 再收集日志和录像."""
+
+    first_connection = ""
+
     @classmethod
     def setUpClass(cls):
         cls.workdir = Path(tempfile.mkdtemp(prefix="dlr_e2e_"))
@@ -160,7 +177,7 @@ class StreamDropTest(unittest.TestCase):
 
         flv = cls.workdir / "source.flv"
         make_source_flv(flv, seconds=60)
-        cls.cdn = FakeLiveCDN(flv)
+        cls.cdn = FakeLiveCDN(flv, cls.first_connection)
         cls.addClassCleanup(cls.cdn.server.server_close)
         cls.addClassCleanup(cls.cdn.server.shutdown)
 
@@ -180,11 +197,7 @@ class StreamDropTest(unittest.TestCase):
         cls.addClassCleanup(program.wait)
         cls.addClassCleanup(kill_process_group, program.pid)
 
-        cls.cdn.wait_for("cut", 1, timeout=60)
-        if cls.cdn.wait_for("request", 2, timeout=RESTART_DEADLINE_SECONDS):
-            time.sleep(10)
-        cls.url_config.write_text("#" + cls.url_line + "\n", encoding="utf-8-sig")
-        cls.cdn.wait_for("client_left", 1, timeout=20)
+        cls.run_scenario()
         time.sleep(5)
 
         ffmpeg_log = cls.workdir / "logs" / "ffmpeg.log"
@@ -193,6 +206,20 @@ class StreamDropTest(unittest.TestCase):
         cls.program_tail = "".join(
             (cls.workdir / "program_output.log").read_text(errors="replace").splitlines(keepends=True)[-20:]
         )
+
+
+@unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "需要 ffmpeg 和 ffprobe")
+@unittest.skipIf(os.name == "nt", "用到了 POSIX 进程组")
+class StreamDropTest(LiveRecorderScenario, unittest.TestCase):
+    first_connection = "reset"
+
+    @classmethod
+    def run_scenario(cls):
+        cls.cdn.wait_for("cut", 1, timeout=60)
+        if cls.cdn.wait_for("request", 2, timeout=RESTART_DEADLINE_SECONDS):
+            time.sleep(10)
+        cls.url_config.write_text("#" + cls.url_line + "\n", encoding="utf-8-sig")
+        cls.cdn.wait_for("client_left", 1, timeout=20)
 
     def test_reconnects_within_a_minute_after_drop(self):
         cuts, requests = self.cdn.times("cut"), self.cdn.times("request")
@@ -212,6 +239,32 @@ class StreamDropTest(unittest.TestCase):
         self.assertTrue(
             any(abs(d - CUT_AFTER_SECONDS) < 2 for d in self.mp4_durations),
             f"没有找到断流前那段约 {CUT_AFTER_SECONDS} 秒的 mp4, 实际: {self.mp4_durations}",
+        )
+
+
+@unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "需要 ffmpeg 和 ffprobe")
+@unittest.skipIf(os.name == "nt", "用到了 POSIX 进程组")
+class FfmpegStallTest(LiveRecorderScenario, unittest.TestCase):
+    first_connection = "stall"
+
+    @classmethod
+    def run_scenario(cls):
+        cls.cdn.wait_for("stall", 1, timeout=60)
+        cls.cdn.wait_for("request", 2, timeout=STALL_RESTART_DEADLINE_SECONDS)
+
+    def test_restarts_after_ffmpeg_stalls(self):
+        stalls, requests = self.cdn.times("stall"), self.cdn.times("request")
+        self.assertTrue(stalls, f"假 CDN 没有进入卡死模式, 程序可能没跑起来:\n{self.program_tail}")
+        self.assertGreaterEqual(len(requests), 2, f"ffmpeg 卡住后 {STALL_RESTART_DEADLINE_SECONDS} 秒内没有重新拉流")
+        self.assertLess(requests[1] - stalls[0], 120)
+
+    def test_stall_is_logged(self):
+        self.assertIn("判定ffmpeg卡死", self.ffmpeg_log)
+
+    def test_stalled_recording_is_still_converted_to_mp4(self):
+        self.assertTrue(
+            any(abs(d - CUT_AFTER_SECONDS) < 2 for d in self.mp4_durations),
+            f"没有找到卡住前那段约 {CUT_AFTER_SECONDS} 秒的 mp4, 实际: {self.mp4_durations}",
         )
 
 
