@@ -23,7 +23,7 @@ import unittest
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-PROGRAM_FILES = ["main.py", "msg_push.py", "ffmpeg_install.py", "i18n.py", "i18n", "src"]
+PROGRAM_FILES = ["main.py", "msg_push.py", "ffmpeg_install.py", "i18n.py", "record_status.py", "i18n", "src"]
 CUT_AFTER_SECONDS = 8
 # 修复前断流后要等满一个循环时间(这里配置为300秒)才会重新拉流
 RESTART_DEADLINE_SECONDS = 75
@@ -203,9 +203,8 @@ class LiveRecorderScenario:
         ffmpeg_log = cls.workdir / "logs" / "ffmpeg.log"
         cls.ffmpeg_log = ffmpeg_log.read_text(encoding="utf-8") if ffmpeg_log.exists() else ""
         cls.mp4_durations = [probe_duration(p) for p in sorted((cls.workdir / "downloads").rglob("*.mp4"))]
-        cls.program_tail = "".join(
-            (cls.workdir / "program_output.log").read_text(errors="replace").splitlines(keepends=True)[-20:]
-        )
+        cls.program_output = (cls.workdir / "program_output.log").read_text(errors="replace")
+        cls.program_tail = "".join(cls.program_output.splitlines(keepends=True)[-20:])
 
 
 @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "需要 ffmpeg 和 ffprobe")
@@ -235,6 +234,15 @@ class StreamDropTest(LiveRecorderScenario, unittest.TestCase):
     def test_stop_by_commenting_out_is_logged(self):
         self.assertIn("录制时被注释或程序退出", self.ffmpeg_log)
 
+    def test_drop_reason_is_shown_in_plain_words(self):
+        self.assertIn("连接被服务器重置, 30秒后复查", self.ffmpeg_log)
+        self.assertIn("最近事件", self.program_output)
+        self.assertIn("连接被服务器重置, 30秒后复查", self.program_output)
+
+    def test_status_screen_is_compact(self):
+        self.assertIn("监测 1 个", self.program_output)
+        self.assertNotIn("xxxxxxxx", self.program_output)
+
     def test_dropped_recording_is_still_converted_to_mp4(self):
         self.assertTrue(
             any(abs(d - CUT_AFTER_SECONDS) < 2 for d in self.mp4_durations),
@@ -260,6 +268,9 @@ class FfmpegStallTest(LiveRecorderScenario, unittest.TestCase):
 
     def test_stall_is_logged(self):
         self.assertIn("判定ffmpeg卡死", self.ffmpeg_log)
+
+    def test_stall_is_shown_in_recent_events(self):
+        self.assertIn("判定卡死, 30秒后复查", self.program_output)
 
     def test_stalled_recording_is_still_converted_to_mp4(self):
         self.assertTrue(

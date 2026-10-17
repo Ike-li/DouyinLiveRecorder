@@ -20,7 +20,9 @@ import datetime
 import re
 import shutil
 import random
+import tempfile
 import uuid
+from collections import deque
 from pathlib import Path
 import urllib.request
 from urllib.error import URLError, HTTPError
@@ -37,6 +39,7 @@ from msg_push import (
 from ffmpeg_install import (
     check_ffmpeg, ffmpeg_path, current_env_path
 )
+from record_status import explain_ffmpeg_exit, render_status
 
 version = "v4.0.7"
 platforms = ("\n国内站点：抖音|快手|虎牙|斗鱼|YY|B站|小红书|bigo|blued|网易CC|千度热播|猫耳FM|Look|TwitCasting|百度|微博|"
@@ -65,6 +68,7 @@ not_record_list = []
 start_display_time = datetime.datetime.now()
 global_proxy = False
 recording_time_list = {}
+recent_events = deque(maxlen=5)
 script_path = os.path.split(os.path.realpath(sys.argv[0]))[0]
 config_file = f'{script_path}/config/config.ini'
 url_config_file = f'{script_path}/config/URL_config.ini'
@@ -92,46 +96,25 @@ signal.signal(signal.SIGTERM, signal_handler)
 def display_info() -> None:
     global start_display_time
     time.sleep(5)
+    print(f"录制设置: {video_record_quality} | {video_save_type} | "
+          f"分段{split_time + '秒' if split_video_by_time else '关闭'} | 每{delay_default}秒检测一次开播")
     while True:
         try:
             sys.stdout.flush()
             time.sleep(5)
             if Path(sys.executable).name != 'pythonw.exe':
                 os.system(clear_command)
-            print(f"\r共监测{monitoring}个直播中", end=" | ")
-            print(f"同一时间访问网络的线程数: {max_request}", end=" | ")
-            print(f"是否开启代理录制: {'是' if use_proxy else '否'}", end=" | ")
-            if split_video_by_time:
-                print(f"录制分段开启: {split_time}秒", end=" | ")
-            else:
-                print("录制分段开启: 否", end=" | ")
-            if create_time_file:
-                print("是否生成时间文件: 是", end=" | ")
-            print(f"录制视频质量为: {video_record_quality}", end=" | ")
-            print(f"录制视频格式为: {video_save_type}", end=" | ")
-            print(f"目前瞬时错误数为: {error_count}", end=" | ")
-            now = time.strftime("%H:%M:%S", time.localtime())
-            print(f"当前时间: {now}")
-
-            if len(recording) == 0:
+            now_time = datetime.datetime.now()
+            recordings = []
+            for recording_live in sorted(set(recording)):
+                record_start_time, _ = recording_time_list[recording_live]
+                elapsed = str(now_time - record_start_time).split('.')[0]
+                recordings.append((recording_live.split(' ', 1)[-1], elapsed))
+            print(render_status(now_time.strftime("%H:%M:%S"), monitoring, recordings, list(recent_events),
+                                delay_default))
+            if not recordings:
                 time.sleep(5)
-                if monitoring == 0:
-                    print("\r没有正在监测和录制的直播")
-                else:
-                    print(f"\r没有正在录制的直播 循环监测间隔时间：{delay_default}秒")
-            else:
-                now_time = datetime.datetime.now()
-                print("x" * 60)
-                no_repeat_recording = list(set(recording))
-                print(f"正在录制{len(no_repeat_recording)}个直播: ")
-                for recording_live in no_repeat_recording:
-                    rt, qa = recording_time_list[recording_live]
-                    have_record_time = now_time - rt
-                    print(f"{recording_live}[{qa}] 正在录制中 {str(have_record_time).split('.')[0]}")
-
-                # print('\n本软件已运行：'+str(now_time - start_display_time).split('.')[0])
-                print("x" * 60)
-                start_display_time = now_time
+            start_display_time = now_time
         except Exception as e:
             logger.error(f"错误信息: {e} 发生错误的行数: {e.__traceback__.tb_lineno}")
 
@@ -424,6 +407,22 @@ def write_ffmpeg_log(record_name: str, message: str) -> None:
         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [{record_name}] {message}\n")
 
 
+def add_event(record_name: str, message: str, log_detail: str = '') -> None:
+    """写进 ffmpeg.log, 同时放进状态看板的"最近事件"(看板上不显示 log_detail 和序号)."""
+    write_ffmpeg_log(record_name, message + log_detail)
+    recent_events.append((time.strftime('%H:%M:%S'), record_name.split(' ', 1)[-1], message))
+
+
+def log_ffmpeg_output(record_name: str, ffmpeg_output) -> str:
+    ffmpeg_output.seek(0)
+    output = ffmpeg_output.read().decode('utf-8', errors='replace')
+    ffmpeg_output.close()
+    for line in output.splitlines():
+        if line.strip():
+            write_ffmpeg_log(record_name, f"ffmpeg输出: {line}")
+    return output
+
+
 def get_recorded_size(save_file_path: str) -> int:
     prefix = os.path.basename(save_file_path).split('%')[0]
     return sum(os.path.getsize(path) for path in utils.get_file_paths(os.path.dirname(save_file_path))
@@ -442,13 +441,13 @@ def stop_ffmpeg(process: subprocess.Popen) -> None:
 def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, save_type: str,
                      script_command: str | None = None) -> bool:
     save_file_path = ffmpeg_command[-1]
-    write_ffmpeg_log(record_name, f"开始录制: {save_file_path}")
-    # 屏幕每5秒清屏一次, ffmpeg的报错直接追加到日志文件, 断流原因才能留下来
-    with open(ffmpeg_log_file, 'ab') as ffmpeg_log:
-        process = subprocess.Popen(
-            ffmpeg_command, stdin=subprocess.PIPE, stdout=ffmpeg_log, stderr=subprocess.STDOUT,
-            startupinfo=get_startup_info(os_type)
-        )
+    add_event(record_name, "开始录制", f": {save_file_path}")
+    # ffmpeg的输出先写进临时文件, 退出后带上主播名写进ffmpeg.log, 几路同时出错时也分得清是谁的
+    ffmpeg_output = tempfile.TemporaryFile()
+    process = subprocess.Popen(
+        ffmpeg_command, stdin=subprocess.PIPE, stdout=ffmpeg_output, stderr=subprocess.STDOUT,
+        startupinfo=get_startup_info(os_type)
+    )
 
     subs_file_path = save_file_path.rsplit('.', maxsplit=1)[0]
     subs_thread_name = f'subs_{Path(subs_file_path).name}'
@@ -468,7 +467,8 @@ def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, sa
             # process.terminate()
             stop_ffmpeg(process)
             process.wait()
-            write_ffmpeg_log(record_name, f"录制时被注释或程序退出, ffmpeg已停止, 返回码: {process.returncode}")
+            log_ffmpeg_output(record_name, ffmpeg_output)
+            add_event(record_name, "录制时被注释或程序退出, ffmpeg已停止", f", 返回码: {process.returncode}")
             return True
         recorded_size = get_recorded_size(save_file_path)
         if recorded_size != last_size:
@@ -487,7 +487,14 @@ def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, sa
         time.sleep(1)
 
     return_code = process.returncode
-    write_ffmpeg_log(record_name, f"ffmpeg退出, 返回码: {return_code}")
+    output = log_ffmpeg_output(record_name, ffmpeg_output)
+    if stalled:
+        reason = f"{ffmpeg_stall_seconds}秒没有新数据, 判定卡死"
+    else:
+        rw_timeout_seconds = int(ffmpeg_command[ffmpeg_command.index("-rw_timeout") + 1]) // 1000000
+        reason = explain_ffmpeg_exit(output, return_code, rw_timeout_seconds)
+    # start_record 在录制结束后固定30秒再检测一次
+    add_event(record_name, f"{reason}, 30秒后复查", f" (ffmpeg退出, 返回码: {return_code})")
     stop_time = time.strftime('%Y-%m-%d %H:%M:%S')
     if return_code == 0 or stalled:
         if converts_to_mp4 and save_type == 'TS':
@@ -499,7 +506,7 @@ def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, sa
                         threading.Thread(target=converts_mp4, args=(path, delete_origin_file)).start()
             else:
                 threading.Thread(target=converts_mp4, args=(save_file_path, delete_origin_file)).start()
-        print(f"\n{record_name} {stop_time} 直播录制完成\n")
+        print(f"\n{record_name} {stop_time} {reason}\n")
 
         if script_command:
             logger.debug("开始执行脚本命令!")
@@ -524,7 +531,7 @@ def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, sa
             logger.debug("脚本命令执行结束!")
 
     else:
-        color_obj.print_colored(f"\n{record_name} {stop_time} 直播录制出错,返回码: {return_code}\n", color_obj.RED)
+        color_obj.print_colored(f"\n{record_name} {stop_time} {reason}\n", color_obj.RED)
 
     recording.discard(record_name)
     return False
@@ -587,6 +594,7 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
     while True:
         try:
             record_finished = False
+            last_recording_ended = False
             run_once = False
             start_pushed = False
             new_record_url = ''
@@ -1090,6 +1098,9 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
 
                     if not port_info.get("anchor_name", ''):
                         print(f'序号{count_variable} 网址内容获取失败,进行重试中...获取失败的地址是:{url_data}')
+                        if platform == '抖音直播':
+                            add_event(f'序号{count_variable} {anchor_name or record_url}',
+                                      f"获取直播间信息失败(可能被风控或网络不通), {delay_default}秒后重试")
                         with max_request_lock:
                             error_count += 1
                             error_window.append(1)
@@ -1114,6 +1125,9 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
                         push_at = datetime.datetime.today().strftime('%Y-%m-%d %H:%M:%S')
                         if port_info['is_live'] is False:
                             print(f"\r{record_name} 等待直播... ")
+                            if last_recording_ended:
+                                add_event(record_name, "录制结束: 主播已下播")
+                                last_recording_ended = False
 
                             if start_pushed:
                                 if over_show_push:
@@ -1642,6 +1656,7 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
 
                                 count_time = time.time()
                                 record_finished = True
+                                last_recording_ended = True
 
                 except Exception as e:
                     logger.error(f"错误信息: {e} 发生错误的行数: {e.__traceback__.tb_lineno}")
