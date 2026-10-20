@@ -28,6 +28,14 @@ import urllib.request
 from urllib.error import URLError, HTTPError
 from typing import Any
 import configparser
+from instance_lock import OTHER_RECORDER_HINT, acquire_machine_lock
+
+# 这台电脑上只运行一个录制程序(包括新的 douyin-live-recorder). 放在 import src 之前: 导入 src 会执行 check_node().
+# 这个变量不能省: 锁文件被回收锁就释放了
+machine_lock = acquire_machine_lock()
+if machine_lock is None:
+    sys.exit(OTHER_RECORDER_HINT)
+
 import httpx
 from src import spider, stream
 from src.proxy import ProxyDetector

@@ -23,7 +23,8 @@ import unittest
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-PROGRAM_FILES = ["main.py", "msg_push.py", "ffmpeg_install.py", "i18n.py", "record_status.py", "i18n", "src"]
+PROGRAM_FILES = ["main.py", "msg_push.py", "ffmpeg_install.py", "i18n.py", "record_status.py", "instance_lock.py",
+                 "i18n", "src"]
 CUT_AFTER_SECONDS = 8
 # 修复前断流后要等满一个循环时间(这里配置为300秒)才会重新拉流
 RESTART_DEADLINE_SECONDS = 75
@@ -190,9 +191,11 @@ class LiveRecorderScenario:
 
         output = open(cls.workdir / "program_output.log", "w")
         cls.addClassCleanup(output.close)
+        # 程序会锁 ~/.douyin-recorder.lock: 换成临时的家目录, 本机正在跑的录制程序就不会把测试挡住
         program = subprocess.Popen(
             [sys.executable, "main.py"], cwd=cls.workdir, stdin=subprocess.DEVNULL, stdout=output,
-            stderr=subprocess.STDOUT, start_new_session=True, env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            stderr=subprocess.STDOUT, start_new_session=True,
+            env={**os.environ, "PYTHONUNBUFFERED": "1", "HOME": str(cls.workdir)},
         )
         cls.addClassCleanup(program.wait)
         cls.addClassCleanup(kill_process_group, program.pid)
